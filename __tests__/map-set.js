@@ -395,6 +395,24 @@ function runBaseTest(name, autoFreeze, useListener) {
 
 			expect(Array.from(newSet)).toEqual([objs[0], objs[1]])
 		})
+
+		test("unmodified draft added to a Set finalizes to its base, not a copy with revoked proxies", () => {
+			const base = {list: [{a: 1}], s: new Set()}
+			const next = produce(base, draft => {
+				// Only read the draft array element. This creates a child draft in
+				// the array's copy_, but does not modify the array itself.
+				void draft.list[0].a
+				// Add the unmodified draft array to the Set
+				draft.s.add(draft.list)
+			})
+			const members = Array.from(next.s)
+			// The set must contain the original array - not its copy_, whose
+			// child drafts are revoked once the producer finishes
+			expect(members).toHaveLength(1)
+			expect(members[0]).toBe(base.list)
+			expect(isDraft(members[0][0])).toBe(false)
+			expect(members[0][0].a).toBe(1)
+		})
 	})
 }
 

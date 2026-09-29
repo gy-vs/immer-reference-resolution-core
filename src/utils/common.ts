@@ -184,13 +184,16 @@ export let getProxyDraft = <T extends any>(value: T): ImmerState | null => {
 /*#__PURE__*/
 export let latest = (state: ImmerState): any => state.copy_ || state.base_
 
-export let getValue = <T extends object>(value: T): T => {
-	const proxyDraft = getProxyDraft(value)
-	return proxyDraft ? (proxyDraft.copy_ ?? proxyDraft.base_) : value
-}
-
 export let getFinalValue = (state: ImmerState): any =>
 	state.modified_ ? state.copy_ : state.base_
+
+export let getValue = <T extends object>(value: T): T => {
+	const proxyDraft = getProxyDraft(value)
+	// Use the same semantics as finalization: an unmodified draft resolves to
+	// its base. Its copy_ may exist (created by reads that drafted children)
+	// and would leak revoked child proxies once the scope is revoked.
+	return proxyDraft ? getFinalValue(proxyDraft) : value
+}
 
 /*#__PURE__*/
 export function shallowCopy(base: any, strict: StrictMode) {

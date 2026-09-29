@@ -671,6 +671,73 @@ function runBaseTest(
 						})
 					})
 				})
+
+				describe("no-op operations", () => {
+					test("push without arguments preserves structural sharing", () => {
+						const base = {items: [1, 2, 3]}
+						const result = produce(base, draft => {
+							expect(draft.items.push()).toBe(3)
+						})
+						expect(result).toBe(base)
+					})
+
+					test("unshift without arguments preserves structural sharing", () => {
+						const base = {items: [1, 2, 3]}
+						const result = produce(base, draft => {
+							expect(draft.items.unshift()).toBe(3)
+						})
+						expect(result).toBe(base)
+					})
+
+					test("pop and shift on an empty array preserve structural sharing", () => {
+						const base = {items: []}
+						const result = produce(base, draft => {
+							expect(draft.items.pop()).toBeUndefined()
+							expect(draft.items.shift()).toBeUndefined()
+						})
+						expect(result).toBe(base)
+					})
+
+					test("splice that deletes and inserts nothing preserves structural sharing", () => {
+						const base = {items: [1, 2, 3]}
+						const result = produce(base, draft => {
+							expect(draft.items.splice(1, 0)).toEqual([])
+							expect(draft.items.splice()).toEqual([])
+							// start beyond the end of the array deletes nothing
+							expect(draft.items.splice(99)).toEqual([])
+							expect(draft.items.splice(99, 2)).toEqual([])
+							// negative deleteCount deletes nothing
+							expect(draft.items.splice(1, -1)).toEqual([])
+						})
+						expect(result).toBe(base)
+					})
+
+					test("sort and reverse on arrays with fewer than two items preserve structural sharing", () => {
+						const base = {items: [1]}
+						const result = produce(base, draft => {
+							draft.items.sort()
+						})
+						expect(result).toBe(base)
+						const result2 = produce(base, draft => {
+							draft.items.reverse()
+						})
+						expect(result2).toBe(base)
+					})
+
+					test("no-op operations produce no patches", () => {
+						const base = {items: [1, 2, 3]}
+						const [result, patches, inverse] = produceWithPatches(
+							base,
+							draft => {
+								draft.items.push()
+								draft.items.splice(1, 0)
+							}
+						)
+						expect(result).toBe(base)
+						expect(patches).toEqual([])
+						expect(inverse).toEqual([])
+					})
+				})
 			})
 
 			describe("non-mutating array methods", () => {

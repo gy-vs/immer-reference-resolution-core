@@ -192,6 +192,28 @@ export function enableArrayMethods() {
 	}
 
 	/**
+	 * Determines whether a `splice` call can actually change the array.
+	 *
+	 * A splice is a no-op when it deletes nothing and inserts nothing, e.g.
+	 * `splice()`, `splice(i, 0)` or `splice(start)` with a start at or beyond
+	 * the end of the array. Detecting this upfront avoids creating a copy and
+	 * marking the draft as changed, so structural sharing is preserved.
+	 */
+	function isNoOpSplice(length: number, args: any[]): boolean {
+		if (args.length === 0) return true
+		// No items to insert (items start at args[2])
+		if (args.length > 2) return false
+		const start = normalizeSliceIndex(args[0] ?? 0, length)
+		const deleteCount =
+			args.length === 1
+				? // splice(start) deletes everything from start onwards
+					length - start
+				: // splice(start, deleteCount) - negative/undefined counts delete nothing
+					Math.min(Math.max(args[1] ?? 0, 0), length - start)
+		return deleteCount <= 0
+	}
+
+	/**
 	 * Calls handleCrossReference for each value being inserted into the array,
 	 * and marks the corresponding indices as assigned in `assigned_`.
 	 *
@@ -234,6 +256,17 @@ export function enableArrayMethods() {
 		method: string,
 		args: any[]
 	) {
+		// No-op guards: a call that cannot change the array must not create a
+		// copy or mark the draft as changed, so structural sharing is preserved.
+		// `push()`/`unshift()` without arguments and `pop()`/`shift()` on an
+		// empty array are no-ops (pop/shift ignore any arguments passed).
+		if (method === "push" || method === "unshift") {
+			// Native push/unshift return the new (here: unchanged) length
+			if (args.length === 0) return latest(state).length
+		} else if (latest(state).length === 0) {
+			// Native pop/shift on an empty array return undefined
+			return undefined
+		}
 		return executeArrayMethod(state, () => {
 			// For push/unshift, capture the length before the operation
 			// so we can compute insertion indices for handleCrossReference
@@ -275,6 +308,10 @@ export function enableArrayMethods() {
 		method: string,
 		args: any[]
 	) {
+		// Reordering fewer than two elements cannot change the array, so skip
+		// copy creation to preserve structural sharing. Native sort/reverse
+		// return the array itself - here the draft, for method chaining.
+		if (latest(state).length < 2) return state.draft_
 		return executeArrayMethod(
 			state,
 			() => {
@@ -324,6 +361,12 @@ export function enableArrayMethods() {
 					}
 
 					if (method === "splice") {
+						// A splice that deletes and inserts nothing is a no-op;
+						// skip copy creation to preserve structural sharing.
+						// Native splice returns the removed elements - here: none.
+						if (isNoOpSplice(latest(state).length, args)) {
+							return []
+						}
 						const res = executeArrayMethod(state, () =>
 							state.copy_!.splice(...(args as [number, number, ...any[]]))
 						)

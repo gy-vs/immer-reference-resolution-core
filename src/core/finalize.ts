@@ -16,6 +16,7 @@ import {
 	revokeScope,
 	isFrozen,
 	get,
+	getArchtype,
 	Patch,
 	latest,
 	prepareCopy,
@@ -296,6 +297,7 @@ export function handleValue(
 	handledSet.add(target)
 
 	// Process ALL properties/entries
+	const targetType = getArchtype(target)
 	each(target, (key, value) => {
 		if (isDraft(value)) {
 			const state: ImmerState = value[DRAFT_STATE]
@@ -304,7 +306,16 @@ export function handleValue(
 
 				const updatedValue = getFinalValue(state)
 
-				set(target, key, updatedValue, target.type_)
+				if (targetType === ArchType.Set) {
+					// A plain Set has no `type_` for the `set` helper, and the
+					// draft entry must be explicitly deleted: adding the finalized
+					// value does not replace a distinct draft reference, otherwise
+					// the (soon revoked) draft leaks into the result.
+					target.delete(value)
+					target.add(updatedValue)
+				} else {
+					set(target, key, updatedValue, targetType)
+				}
 
 				markStateFinalized(state)
 			}

@@ -5,7 +5,8 @@ import {
 	markChanged,
 	prepareCopy,
 	handleCrossReference,
-	ProxyArrayState
+	ProxyArrayState,
+	DRAFT_STATE
 } from "../internal"
 
 /**
@@ -169,14 +170,42 @@ export function enableArrayMethods() {
 	// Shared utility functions for array method handlers
 	function executeArrayMethod<T>(
 		state: ProxyArrayState,
-		operation: () => T,
-		markLength = true
+		operation: () => T
 	): T {
 		prepareCopy(state)
 		const result = operation()
 		markChanged(state)
-		if (markLength) state.assigned_!.set("length", true)
+		state.assigned_!.set("length", true)
 		return result
+	}
+
+	/**
+	 * Compares a copy element against its base counterpart for identity,
+	 * treating a draft as equivalent to the base it was (still) drafted from.
+	 *
+	 * Reordering methods run on the raw copy, so unmodified slots hold raw
+	 * base references, while slots touched through the draft may hold child
+	 * draft proxies. Either way the logical value is unchanged, so this keeps
+	 * a no-op `sort`/`reverse` observable as a no-op, matching the behavior of
+	 * running those methods directly against an Immer draft without this plugin.
+	 */
+	function isSameSlotValue(baseValue: any, copyValue: any) {
+		if (baseValue === copyValue) return true
+		const childState = copyValue?.[DRAFT_STATE]
+		return !!childState && childState.base_ === baseValue
+	}
+
+	/**
+	 * Returns true when `copy_` is element-for-element identical to `base_`,
+	 * i.e. a mutating operation didn't actually change any value. Lengths are
+	 * expected to be equal by the callers that need this check.
+	 */
+	function copyEqualsBase(state: ProxyArrayState) {
+		const {base_, copy_} = state
+		for (let i = 0; i < base_.length; i++) {
+			if (!isSameSlotValue(base_[i], copy_![i])) return false
+		}
+		return true
 	}
 
 	function markAllIndicesReassigned(state: ProxyArrayState) {
@@ -189,6 +218,34 @@ export function enableArrayMethods() {
 			return Math.max(length + index, 0)
 		}
 		return Math.min(index, length)
+	}
+
+	/**
+	 * Normalizes the `start` argument of `Array.prototype.splice`, which wraps
+	 * negative offsets from the end (unlike slice) and clamps the result into
+	 * [0, length]. Non-numbers follow the spec's ToIntegerOrInfinity rules
+	 * (`undefined` becomes 0, `NaN` becomes 0).
+	 */
+	function normalizeSpliceStart(rawStart: number | undefined, length: number) {
+		const start = rawStart === undefined ? 0 : Math.trunc(rawStart)
+		if (Number.isNaN(start)) return 0
+		return start < 0 ? Math.max(length + start, 0) : Math.min(start, length)
+	}
+
+	/**
+	 * Normalizes the `deleteCount` argument of `Array.prototype.splice`,
+	 * clamped to [0, length - start]. Non-numbers follow the spec
+	 * (`undefined` deletes the rest, `NaN` deletes nothing).
+	 */
+	function normalizeSpliceDeleteCount(
+		rawDeleteCount: number | undefined,
+		length: number,
+		start: number
+	) {
+		if (rawDeleteCount === undefined) return length - start
+		const deleteCount = Math.trunc(rawDeleteCount)
+		if (Number.isNaN(deleteCount) || deleteCount <= 0) return 0
+		return Math.min(deleteCount, length - start)
 	}
 
 	/**
@@ -227,6 +284,12 @@ export function enableArrayMethods() {
 	 * For shifting methods (shift, unshift), marks all indices as reassigned since
 	 * indices shift.
 	 *
+	 * Operations that provably leave the array unchanged (`push()` / `unshift()`
+	 * without arguments, `pop()` / `shift()` on an empty array) are treated as
+	 * no-ops: the draft is neither copied nor marked changed, so structural
+	 * sharing is preserved exactly like running these methods without the
+	 * array-methods plugin.
+	 *
 	 * @returns For push/pop/shift/unshift: the native method result. For others: the draft.
 	 */
 	function handleSimpleOperation(
@@ -234,6 +297,18 @@ export function enableArrayMethods() {
 		method: string,
 		args: any[]
 	) {
+		// Fast no-ops: on an unmodified draft these methods don't touch the
+		// array at all, so we must not allocate a copy or mark it changed.
+		if (!state.modified_) {
+			const length = state.base_.length
+			if (args.length === 0 && (method === "push" || method === "unshift")) {
+				return length
+			}
+			if (length === 0 && (method === "pop" || method === "shift")) {
+				return undefined
+			}
+		}
+
 		return executeArrayMethod(state, () => {
 			// For push/unshift, capture the length before the operation
 			// so we can compute insertion indices for handleCrossReference
@@ -268,6 +343,11 @@ export function enableArrayMethods() {
 	 * since element positions change. Does not mark length as changed since
 	 * these operations preserve array length.
 	 *
+	 * If running the method leaves the elements in the same order (e.g.
+	 * `reverse()` on a 0/1 element array, or a `sort()` that compares every
+	 * pair as equal), the operation is a no-op and the draft is left
+	 * unmodified, preserving structural sharing with the base state.
+	 *
 	 * @returns The draft proxy for method chaining.
 	 */
 	function handleReorderingOperation(
@@ -275,15 +355,22 @@ export function enableArrayMethods() {
 		method: string,
 		args: any[]
 	) {
-		return executeArrayMethod(
-			state,
-			() => {
-				;(state.copy_! as any)[method](...args)
-				markAllIndicesReassigned(state)
-				return state.draft_
-			},
-			false
-		) // Don't mark length as changed
+		// No ordering can change with fewer than two elements, and neither
+		// method mutates an array that short natively either.
+		if (!state.modified_ && state.base_.length < 2) return state.draft_
+
+		prepareCopy(state)
+		;(state.copy_! as any)[method](...args)
+
+		if (!state.modified_) {
+			// The method might still have reordered nothing (stable sort with
+			// an equal comparator); verify before committing the change.
+			if (copyEqualsBase(state)) return state.draft_
+		}
+
+		markChanged(state)
+		markAllIndicesReassigned(state)
+		return state.draft_
 	}
 
 	/**
@@ -324,17 +411,39 @@ export function enableArrayMethods() {
 					}
 
 					if (method === "splice") {
+						// Detect no-op splices (nothing removed and nothing inserted)
+						// before copying/marking, matching native behavior where the
+						// array stays untouched.
+						if (!state.modified_) {
+							const length = state.base_.length
+							const start = normalizeSpliceStart(args[0], length)
+							const deleteCount = normalizeSpliceDeleteCount(
+								args.length < 2 ? undefined : args[1],
+								length,
+								start
+							)
+							if (deleteCount === 0 && args.length <= 2) {
+								return []
+							}
+						}
+
+						// Normalize the insertion index against the pre-splice
+						// length of the current copy (which can differ from
+						// base_.length after earlier mutations in the same
+						// producer), so cross-reference bookkeeping targets the
+						// same slots the native splice actually writes to.
+						const insertionIndex = normalizeSpliceStart(
+							args[0],
+							latest(state).length
+						)
+
 						const res = executeArrayMethod(state, () =>
 							state.copy_!.splice(...(args as [number, number, ...any[]]))
 						)
 						markAllIndicesReassigned(state)
 						// Handle cross-references for inserted values (args from index 2+)
 						if (args.length > 2) {
-							const startIndex = normalizeSliceIndex(
-								args[0] ?? 0,
-								state.copy_!.length
-							)
-							handleInsertedValues(state, startIndex, args.slice(2))
+							handleInsertedValues(state, insertionIndex, args.slice(2))
 						}
 						return res
 					}
